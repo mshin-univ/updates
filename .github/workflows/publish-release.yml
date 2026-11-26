@@ -1,0 +1,248 @@
+# Publishes a DRAFT release that was uploaded beforehand (assets too large for a git push: > 100 MB per file).
+# This repository serves several products; publish.yml (installer pushed on an incoming/* branch) is unchanged.
+#
+# Flow: the maintainer uploads the signed assets + version.json to a DRAFT release <slug>-v<version>
+# (gh release create --draft), then runs this workflow (workflow_dispatch: slug, version, dry_run).
+# dry_run (default TRUE): run every check below and print a summary only - the draft is not touched, nothing is
+# published and main is not written. Publishing happens only with dry_run=false set explicitly.
+# Operating order (PM): product E2E passed -> real draft, dry_run=true once -> PM check -> dry_run=false.
+# The bot downloads every asset and checks, in order:
+#   1. release is a draft, tag = <slug>-v<version>, asset names/count = the product's whitelist
+#   2. every .exe: Authenticode Valid, timestamp, CN=Myung Shin, profile EKU
+#   3. SHA256SUMS.txt covers every asset (.bin included) and every hash matches; each asset < 2 GiB
+#   4. version.json: product/version/url/sha256 match this release and the product table below
+#   5. generic personal-data patterns in TEXT assets only (no secret word list: the product-specific forbidden-word
+#      check runs locally before upload, in make_signed / upload_release, and its list never leaves the PC)
+# Only if all pass (repository uses IMMUTABLE releases: assets can't change after publishing):
+#   version.json kept in RUNNER_TEMP -> deleted from the DRAFT -> draft re-checked (assets without version.json,
+#   notes) -> published (--latest=false) -> bot commits <slug>/version.json to main.
+# If the run fails before publishing, the draft stays private: upload version.json to the draft again and rerun.
+# A wrongly published immutable release can only be deleted (its tag name can never be reused) -> ship a new version.
+#   https://docs.github.com/en/code-security/supply-chain-security/understanding-your-software-supply-chain/immutable-releases
+name: publish-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      slug:
+        description: product folder on main
+        required: true
+        type: choice
+        options: [lingualive, invoice]
+      version:
+        description: x.y.z
+        required: true
+        type: string
+      dry_run:
+        description: checks only (no draft change, no publish, no main commit)
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+  queue: max          # tax review: default 'single' would cancel a pending publish.yml run while this one runs
+  # 'queue' (single|max): https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#concurrency
+
+jobs:
+  publish:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Verify draft release
+        id: verify
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SLUG: ${{ inputs.slug }}
+          VER: ${{ inputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          [Console]::OutputEncoding = [Text.UTF8Encoding]::new()   # gh prints UTF-8 (Korean notes)
+          # ---- fixed product table (slug -> product id and exact asset names) ----
+          # product must stay what the deployed clients check (invoice 2.0.0 clients require product == 'invoice').
+          $products = @{
+            'lingualive' = @{
+              product = 'dk-lingualive'
+              app     = 'DKLinguaLive_{0}_Protected_Setup.exe'
+              assets  = @('DKLinguaLive_{0}_Protected_Setup.exe', 'DKLinguaLive_{0}_Protected_Setup.exe.sha256',
+                          'SHA256SUMS.txt', 'THIRD_PARTY_NOTICES.txt', 'version.json')
+              optional = @()
+              models  = '^DKLinguaLive_Models_\d{4}\.\d+\.\d+_Setup(\.exe|-[1-9]\.bin)$'   # model pack exe + slices
+              modelCount = 3
+              needFile = $false
+            }
+            'invoice' = @{
+              product = 'invoice'
+              app     = 'TaxInvoiceBatchHelper_{0}_Setup.exe'
+              assets  = @('TaxInvoiceBatchHelper_{0}_Setup.exe', 'TaxInvoiceBatchHelper_{0}_Setup.exe.sha256',
+                          'SHA256SUMS.txt', 'version.json')
+              optional = @('THIRD_PARTY_NOTICES.txt')
+              models  = $null
+              modelCount = 0
+              needFile = $true        # invoice clients read version.json 'file'
+            }
+          }
+          $slug = $env:SLUG; $ver = $env:VER
+          if (-not $products.ContainsKey($slug)) { throw "unknown slug $slug" }
+          if ($ver -notmatch '^\d+\.\d+\.\d+$') { throw "version must be x.y.z" }
+          $p = $products[$slug]; $tag = "$slug-v$ver"
+          # names, urls and product ids are compared CASE-SENSITIVELY below (-ceq/-cne/-cin/-cnotin/-cmatch, ordinal dictionary):
+          # GitHub asset URLs and the clients are case-sensitive, PowerShell defaults are not (tax review).
+          # releases/tags/<tag> does not return drafts, so the draft is found in the (paginated) release list
+          $pages = gh api --paginate --slurp "repos/${{ github.repository }}/releases?per_page=100" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw "release list failed" }
+          $rel = @(@($pages | ForEach-Object { $_ }) | Where-Object { $_.tag_name -ceq $tag -and $_.draft })
+          if ($rel.Count -ne 1) { throw "exactly one DRAFT release with tag $tag expected (found $($rel.Count))" }
+          $rel = $rel[0]
+          $snap = @($rel.assets | Sort-Object name | ForEach-Object { [pscustomobject]@{ id = "$($_.id)"; name = "$($_.name)"; size = "$($_.size)"; digest = "$($_.digest)" } })
+          $nod = @($snap | Where-Object { -not $_.digest })
+          if ($nod) { throw "API gave no digest for: $($nod.name -join ', ') - cannot pin the verified content" }
+          ConvertTo-Json -InputObject $snap -Depth 3 | Set-Content "$env:RUNNER_TEMP/assets_verified.json" -Encoding utf8
+          Set-Content "$env:RUNNER_TEMP/body_verified.txt" -Value "$($rel.body)" -Encoding utf8 -NoNewline
+          "release_id=$($rel.id)" >> $env:GITHUB_OUTPUT
+
+          # 1. whitelist
+          $names = @($snap | ForEach-Object name)
+          $want = @($p.assets | ForEach-Object { $_ -f $ver })
+          $missing = @($want | Where-Object { $_ -cnotin $names })
+          $models = @(if ($p.modelCount -gt 0) { $names | Where-Object { $_ -cmatch $p.models } })
+          $extra = @($names | Where-Object { $_ -cnotin $want -and $_ -cnotin $p.optional -and $_ -cnotin $models })
+          if ($missing) { throw "missing assets: $($missing -join ', ')" }
+          if ($extra) { throw "assets not on the whitelist: $($extra -join ', ')" }
+          if ($p.modelCount -gt 0 -and ($models.Count -ne $p.modelCount -or -not ($models | Where-Object { $_ -clike '*.exe' }))) {
+            throw "model pack must be 1 exe + $($p.modelCount - 1) slices (found: $($models -join ', '))" }
+          New-Item -ItemType Directory -Force dl | Out-Null
+          gh release download $tag --dir dl
+          if ($LASTEXITCODE -ne 0) { throw "download failed" }
+          $files = @(Get-ChildItem dl -File)
+          if ($files.Count -ne $names.Count) { throw "downloaded $($files.Count) of $($names.Count) assets" }
+
+          # 2. signatures
+          foreach ($f in $files | Where-Object Extension -eq '.exe') {
+            $s = Get-AuthenticodeSignature -LiteralPath $f.FullName
+            if ("$($s.Status)" -ne 'Valid') { throw "$($f.Name): signature status $($s.Status)" }
+            if (-not $s.TimeStamperCertificate) { throw "$($f.Name): no timestamp" }
+            if ($s.SignerCertificate.Subject -notmatch '(^|,\s*)CN=Myung Shin(,|$)') { throw "$($f.Name): unexpected publisher" }
+            $eku = $s.SignerCertificate.Extensions | Where-Object { $_.Oid.Value -eq '2.5.29.37' }
+            if (-not ($eku.EnhancedKeyUsages.Value -contains '1.3.6.1.4.1.311.97.880848874.937312352.607266834.698134517')) { throw "$($f.Name): profile EKU missing" }
+          }
+
+          # 3. hashes and sizes
+          $sums = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::Ordinal)
+          foreach ($l in Get-Content dl/SHA256SUMS.txt) { if ($l.Trim()) { $h, $n = $l.Trim() -split '\s+', 2; $n = $n.TrimStart('*'); $sums[$n] = $h.ToLower() } }
+          foreach ($f in $files) {
+            if ($f.Length -ge 2147483648) { throw "$($f.Name) >= 2 GiB" }
+            if ($f.Name -cin 'SHA256SUMS.txt', 'version.json' -or $f.Name -clike '*.exe.sha256') { continue }
+            if (-not $sums.ContainsKey($f.Name)) { throw "$($f.Name) not in SHA256SUMS.txt" }
+            if ((Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash.ToLower() -ne $sums[$f.Name]) { throw "$($f.Name): sha256 mismatch" }
+          }
+          foreach ($n in $sums.Keys) { if ($n -cnotin $names) { throw "SHA256SUMS.txt lists $n, which is not an asset" } }
+          foreach ($a in $snap) {
+            $got = (Get-FileHash -LiteralPath "dl/$($a.name)" -Algorithm SHA256).Hash.ToLower()
+            if ("$($a.digest)".ToLower() -ne "sha256:$got") { throw "$($a.name): downloaded file != API digest" }
+          }
+          $appName = $p.app -f $ver
+          $appHash = (Get-FileHash -LiteralPath "dl/$appName" -Algorithm SHA256).Hash.ToLower()
+          if (Test-Path "dl/$appName.sha256") {
+            if (((Get-Content "dl/$appName.sha256" -Raw).Trim() -split '\s+')[0].ToLower() -ne $appHash) { throw "$appName.sha256 mismatch" } }
+
+          # 4. manifest
+          $m = Get-Content dl/version.json -Raw | ConvertFrom-Json
+          $url = "https://github.com/${{ github.repository }}/releases/download/$tag/$appName"
+          if ($m.product -cne $p.product) { throw "version.json product '$($m.product)' != '$($p.product)'" }
+          if ($m.version -cne $ver) { throw "version.json version $($m.version) != $ver" }
+          if ($m.url -cne $url) { throw "version.json url must be $url" }
+          if ("$($m.sha256)".ToLower() -ne $appHash) { throw "version.json sha256 != $appName" }
+          if ($p.needFile -and $m.file -cne $appName) { throw "version.json file must be $appName" }
+          if ($m.file -and $m.file -cne $appName) { throw "version.json file '$($m.file)' != $appName" }
+
+          # 5. generic personal-data patterns, text assets only (nothing secret here; matches are not printed)
+          $pats = [ordered]@{
+            'Korean mobile number'    = '(?<!\d)01[016789][-. ]?\d{3,4}[-. ]?\d{4}(?!\d)'
+            'Korean business number'  = '(?<!\d)\d{3}-\d{2}-\d{5}(?!\d)'
+            'e-mail address'          = '[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+'
+            'Windows user path'       = '(?i)[a-z]:[\\/]+users[\\/]+'
+          }
+          foreach ($f in $files | Where-Object { $_.Extension -in '.txt', '.json', '.md', '.sha256' }) {
+            $t = Get-Content -LiteralPath $f.FullName -Raw -Encoding utf8
+            $t = $t -replace '\b[0-9a-fA-F]{64}\b', ''     # SHA-256 values could look like phone numbers by chance
+            foreach ($k in $pats.Keys) {
+              # third-party license texts legitimately carry the upstream authors' e-mail addresses
+              if ($k -eq 'e-mail address' -and $f.Name -ceq 'THIRD_PARTY_NOTICES.txt') { continue }
+              if ($t -match $pats[$k]) { throw "$($f.Name): $k pattern found (value not printed)" }
+            }
+          }
+          foreach ($k in $pats.Keys) {     # the release notes (body) are published as well
+            if ("$($rel.body)" -match $pats[$k]) { throw "release notes: $k pattern found (value not printed)" }
+          }
+          Copy-Item dl/version.json "$env:RUNNER_TEMP/version.json"
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "slug=$slug" >> $env:GITHUB_OUTPUT
+          "ver=$ver" >> $env:GITHUB_OUTPUT
+          "OK: $tag, $($files.Count) assets verified"
+          $sum = @("### publish-release: $tag", "", "| asset | bytes | sha256 |", "|---|---|---|")
+          $sum += @($files | Sort-Object Name | ForEach-Object { "| $($_.Name) | $($_.Length) | $((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLower().Substring(0,16))... |" })
+          $sum += @("", "All checks passed: whitelist, signatures, SHA256SUMS + API digest, sizes, manifest, text patterns, notes.")
+          $sum += $(if ("${{ inputs.dry_run }}" -ceq 'false') { "dry_run=false -> publishing next." } else { "**DRY RUN** - draft unchanged, nothing published, main not written." })
+          $sum | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8
+
+      - name: Publish release
+        if: ${{ inputs.dry_run == false }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          [Console]::OutputEncoding = [Text.UTF8Encoding]::new()   # gh prints UTF-8 (Korean notes)
+          $tag = '${{ steps.verify.outputs.tag }}'
+          $rid = '${{ steps.verify.outputs.release_id }}'
+          # immutable releases: the manifest must leave the DRAFT before publishing (it lives on main, not as an asset).
+          # If anything below fails, the draft stays private: re-upload version.json to it and rerun this workflow.
+          gh release delete-asset $tag version.json --yes      # exact name was checked case-sensitively above
+          if ($LASTEXITCODE -ne 0) { throw "could not remove version.json from the draft" }
+          # TOCTOU (tax review): the draft must still hold exactly the verified assets (minus version.json) and notes
+          $now = @(gh api "repos/${{ github.repository }}/releases/$rid/assets?per_page=100" | ConvertFrom-Json)
+          if ($LASTEXITCODE -ne 0) { throw "asset list failed" }
+          $a = (@($now | Sort-Object name | ForEach-Object { "$($_.id)|$($_.name)|$($_.size)|$($_.digest)" }) -join "`n")
+          $b = (@(Get-Content "$env:RUNNER_TEMP/assets_verified.json" -Raw | ConvertFrom-Json | Where-Object { $_.name -cne 'version.json' } |
+                  ForEach-Object { "$($_.id)|$($_.name)|$($_.size)|$($_.digest)" }) -join "`n")
+          if ($a -cne $b) { throw "draft assets changed after verification - not published" }
+          $relNow = gh api "repos/${{ github.repository }}/releases/$rid" | ConvertFrom-Json     # same path as at verify
+          if ($LASTEXITCODE -ne 0) { throw "release read failed" }
+          $n1 = ("$($relNow.body)" -replace "`r`n", "`n").Trim()
+          $n0 = ((Get-Content "$env:RUNNER_TEMP/body_verified.txt" -Raw -Encoding utf8 -ErrorAction SilentlyContinue) + '' -replace "`r`n", "`n").Trim()
+          if ($n1 -cne $n0) { throw "release notes changed after verification - not published" }
+          # --latest=false: several products share this repository, so no single "latest" release.
+          gh release edit $tag --draft=false --latest=false --target main
+          if ($LASTEXITCODE -ne 0) { throw "publish failed (draft kept; re-upload version.json and rerun)" }
+
+      - name: Record <slug>/version.json on main
+        if: ${{ inputs.dry_run == false }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          [Console]::OutputEncoding = [Text.UTF8Encoding]::new()   # gh prints UTF-8 (Korean notes)
+          $slug = '${{ steps.verify.outputs.slug }}'
+          function Invoke-Git { git @args; if ($LASTEXITCODE -ne 0) { throw "git $($args -join ' ') failed ($LASTEXITCODE)" } }
+          Invoke-Git config user.name  "github-actions[bot]"
+          Invoke-Git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          for ($try = 1; $try -le 3; $try++) {
+            Invoke-Git fetch origin main
+            Invoke-Git checkout -B main origin/main
+            New-Item -ItemType Directory -Force $slug | Out-Null
+            Copy-Item "$env:RUNNER_TEMP/version.json" "$slug/version.json" -Force
+            Invoke-Git add "$slug/version.json"
+            git diff --cached --quiet
+            if ($LASTEXITCODE -eq 0) { "main already has this version.json"; break }
+            Invoke-Git commit -m "$slug ${{ steps.verify.outputs.ver }}"
+            git push origin main
+            if ($LASTEXITCODE -eq 0) { "pushed $slug/version.json"; break }
+            if ($try -eq 3) { throw "git push failed 3 times" }
+            "push rejected (try $try), refetching"
+          }

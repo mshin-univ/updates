@@ -51,6 +51,9 @@ concurrency:
 jobs:
   publish:
     runs-on: windows-latest
+    env:                       # G5 (_PM 06_재발방지): values reach scripts only through env, never expressions in run:
+      REPO: ${{ github.repository }}
+      DRY_RUN: ${{ inputs.dry_run }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
@@ -95,7 +98,7 @@ jobs:
           # names, urls and product ids are compared CASE-SENSITIVELY below (-ceq/-cne/-cin/-cnotin/-cmatch, ordinal dictionary):
           # GitHub asset URLs and the clients are case-sensitive, PowerShell defaults are not (tax review).
           # releases/tags/<tag> does not return drafts, so the draft is found in the (paginated) release list
-          $pages = gh api --paginate --slurp "repos/${{ github.repository }}/releases?per_page=100" | ConvertFrom-Json
+          $pages = gh api --paginate --slurp "repos/$env:REPO/releases?per_page=100" | ConvertFrom-Json
           if ($LASTEXITCODE -ne 0) { throw "release list failed" }
           $rel = @(@($pages | ForEach-Object { $_ }) | Where-Object { $_.tag_name -ceq $tag -and $_.draft })
           if ($rel.Count -ne 1) { throw "exactly one DRAFT release with tag $tag expected (found $($rel.Count))" }
@@ -128,7 +131,7 @@ jobs:
             $s = Get-AuthenticodeSignature -LiteralPath $f.FullName
             if ("$($s.Status)" -ne 'Valid') { throw "$($f.Name): signature status $($s.Status)" }
             if (-not $s.TimeStamperCertificate) { throw "$($f.Name): no timestamp" }
-            if ($s.SignerCertificate.Subject -notmatch '(^|,\s*)CN=Myung Shin(,|$)') { throw "$($f.Name): unexpected publisher" }
+            if ($s.SignerCertificate.Subject -cnotmatch '(^|,\s*)CN=Myung Shin(,|$)') { throw "$($f.Name): unexpected publisher" }
             $eku = $s.SignerCertificate.Extensions | Where-Object { $_.Oid.Value -eq '2.5.29.37' }
             if (-not ($eku.EnhancedKeyUsages.Value -contains '1.3.6.1.4.1.311.97.880848874.937312352.607266834.698134517')) { throw "$($f.Name): profile EKU missing" }
           }
@@ -154,7 +157,7 @@ jobs:
 
           # 4. manifest
           $m = Get-Content dl/version.json -Raw | ConvertFrom-Json
-          $url = "https://github.com/${{ github.repository }}/releases/download/$tag/$appName"
+          $url = "https://github.com/$env:REPO/releases/download/$tag/$appName"
           if ($m.product -cne $p.product) { throw "version.json product '$($m.product)' != '$($p.product)'" }
           if ($m.version -cne $ver) { throw "version.json version $($m.version) != $ver" }
           if ($m.url -cne $url) { throw "version.json url must be $url" }
@@ -189,7 +192,7 @@ jobs:
           $sum = @("### publish-release: $tag", "", "| asset | bytes | sha256 |", "|---|---|---|")
           $sum += @($files | Sort-Object Name | ForEach-Object { "| $($_.Name) | $($_.Length) | $((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLower().Substring(0,16))... |" })
           $sum += @("", "All checks passed: whitelist, signatures, SHA256SUMS + API digest, sizes, manifest, text patterns, notes.")
-          $sum += $(if ("${{ inputs.dry_run }}" -ceq 'false') { "dry_run=false -> publishing next." } else { "**DRY RUN** - draft unchanged, nothing published, main not written." })
+          $sum += $(if ("$env:DRY_RUN" -ceq 'false') { "dry_run=false -> publishing next." } else { "**DRY RUN** - draft unchanged, nothing published, main not written." })
           $sum | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8
 
       - name: Publish release
@@ -197,23 +200,25 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.verify.outputs.tag }}
+          RID: ${{ steps.verify.outputs.release_id }}
         run: |
           $ErrorActionPreference = 'Stop'
           [Console]::OutputEncoding = [Text.UTF8Encoding]::new()   # gh prints UTF-8 (Korean notes)
-          $tag = '${{ steps.verify.outputs.tag }}'
-          $rid = '${{ steps.verify.outputs.release_id }}'
+          $tag = $env:TAG; $rid = $env:RID
+          if ($tag -cnotmatch '^[a-z0-9][a-z0-9-]*-v\d+\.\d+\.\d+$' -or $rid -notmatch '^\d+$') { throw "bad step outputs" }
           # immutable releases: the manifest must leave the DRAFT before publishing (it lives on main, not as an asset).
           # If anything below fails, the draft stays private: re-upload version.json to it and rerun this workflow.
           gh release delete-asset $tag version.json --yes      # exact name was checked case-sensitively above
           if ($LASTEXITCODE -ne 0) { throw "could not remove version.json from the draft" }
           # TOCTOU (tax review): the draft must still hold exactly the verified assets (minus version.json) and notes
-          $now = @(gh api "repos/${{ github.repository }}/releases/$rid/assets?per_page=100" | ConvertFrom-Json)
+          $now = @(gh api "repos/$env:REPO/releases/$rid/assets?per_page=100" | ConvertFrom-Json)
           if ($LASTEXITCODE -ne 0) { throw "asset list failed" }
           $a = (@($now | Sort-Object name | ForEach-Object { "$($_.id)|$($_.name)|$($_.size)|$($_.digest)" }) -join "`n")
           $b = (@(Get-Content "$env:RUNNER_TEMP/assets_verified.json" -Raw | ConvertFrom-Json | Where-Object { $_.name -cne 'version.json' } |
                   ForEach-Object { "$($_.id)|$($_.name)|$($_.size)|$($_.digest)" }) -join "`n")
           if ($a -cne $b) { throw "draft assets changed after verification - not published" }
-          $relNow = gh api "repos/${{ github.repository }}/releases/$rid" | ConvertFrom-Json     # same path as at verify
+          $relNow = gh api "repos/$env:REPO/releases/$rid" | ConvertFrom-Json     # same path as at verify
           if ($LASTEXITCODE -ne 0) { throw "release read failed" }
           $n1 = ("$($relNow.body)" -replace "`r`n", "`n").Trim()
           $n0 = ((Get-Content "$env:RUNNER_TEMP/body_verified.txt" -Raw -Encoding utf8 -ErrorAction SilentlyContinue) + '' -replace "`r`n", "`n").Trim()
@@ -225,10 +230,14 @@ jobs:
       - name: Record <slug>/version.json on main
         if: ${{ inputs.dry_run == false }}
         shell: pwsh
+        env:
+          SLUG: ${{ steps.verify.outputs.slug }}
+          VER: ${{ steps.verify.outputs.ver }}
         run: |
           $ErrorActionPreference = 'Stop'
           [Console]::OutputEncoding = [Text.UTF8Encoding]::new()   # gh prints UTF-8 (Korean notes)
-          $slug = '${{ steps.verify.outputs.slug }}'
+          $slug = $env:SLUG; $ver = $env:VER
+          if ($slug -cnotmatch '^[a-z0-9][a-z0-9-]*$' -or $ver -notmatch '^\d+\.\d+\.\d+$') { throw "bad step outputs" }
           function Invoke-Git { git @args; if ($LASTEXITCODE -ne 0) { throw "git $($args -join ' ') failed ($LASTEXITCODE)" } }
           Invoke-Git config user.name  "github-actions[bot]"
           Invoke-Git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -240,7 +249,7 @@ jobs:
             Invoke-Git add "$slug/version.json"
             git diff --cached --quiet
             if ($LASTEXITCODE -eq 0) { "main already has this version.json"; break }
-            Invoke-Git commit -m "$slug ${{ steps.verify.outputs.ver }}"
+            Invoke-Git commit -m "$slug $ver"
             git push origin main
             if ($LASTEXITCODE -eq 0) { "pushed $slug/version.json"; break }
             if ($try -eq 3) { throw "git push failed 3 times" }

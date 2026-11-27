@@ -118,7 +118,9 @@ jobs:
           $extra = @($names | Where-Object { $_ -cnotin $want -and $_ -cnotin $p.optional -and $_ -cnotin $models })
           if ($missing) { throw "missing assets: $($missing -join ', ')" }
           if ($extra) { throw "assets not on the whitelist: $($extra -join ', ')" }
-          if ($p.modelCount -gt 0 -and ($models.Count -ne $p.modelCount -or -not ($models | Where-Object { $_ -clike '*.exe' }))) {
+          # 2.0.1+: models optional - a release either has the full model pack (1 exe + slices) or none (the app Setup
+          # then installs the model pack of an earlier immutable release). A partial set is still refused.
+          if ($p.modelCount -gt 0 -and $models.Count -gt 0 -and ($models.Count -ne $p.modelCount -or -not ($models | Where-Object { $_ -clike '*.exe' }))) {
             throw "model pack must be 1 exe + $($p.modelCount - 1) slices (found: $($models -join ', '))" }
           New-Item -ItemType Directory -Force dl | Out-Null
           gh release download $tag --dir dl

@@ -1,8 +1,8 @@
 {
- "version": "2.0.0",
- "url": "https://github.com/mshin-univ/updates/releases/download/lingualive-v2.0.0/DKLinguaLive_2.0.0_Protected_Setup.exe",
- "sha256": "9f75246f04c79d28dd3dc04b001534434c50245d8875afaf1c5c69ad3d9e0017",
- "notes": "",
+ "version": "2.0.1",
+ "url": "https://github.com/mshin-univ/updates/releases/download/lingualive-v2.0.1/DKLinguaLive_2.0.1_Protected_Setup.exe",
+ "sha256": "763018fd0c80f640d81455798a42f14b4217a2e712ae9f39910dcc1d20e0e8ef",
+ "notes": "설치 파일 하나로 모델(언어) 팩까지 설치 · 모델별 확인(없는 것만 끄고 안내) · 첫 실행 지연 줄임 · 업데이트 설치 때 창 멈춤 없앰 · AI 키 거부 안내. 알려진 한계: 모델 받기는 이어받기 없음",
  "product": "dk-lingualive",
- "date": "2026-11-25"
+ "date": "2026-11-27"
 }

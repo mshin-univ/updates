@@ -1,8 +1,8 @@
 {
-  "version": "2.0.2",
+  "version": "2.0.3",
   "product": "invoice",
-  "file": "TaxInvoiceBatchHelper_2.0.2_Setup.exe",
-  "url": "https://github.com/mshin-univ/updates/releases/download/invoice-v2.0.2/TaxInvoiceBatchHelper_2.0.2_Setup.exe",
-  "sha256": "00e52a2a857fd1735a2420d73b41dd6a7e407927fe5231b38320f743af69317d",
-  "notes": "Settings carry over from earlier installs; small reliability fixes."
+  "file": "TaxInvoiceBatchHelper_2.0.3_Setup.exe",
+  "url": "https://github.com/mshin-univ/updates/releases/download/invoice-v2.0.3/TaxInvoiceBatchHelper_2.0.3_Setup.exe",
+  "sha256": "0b4d2f74aafdcfa8c8f727ced8eff574e517b3eb30116eca6973a3a1f55ed7ef",
+  "notes": "Stricter update checks; pre-release builds are not offered as updates."
 }
